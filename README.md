@@ -1,36 +1,52 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# App Builder Studio
 
-## Getting Started
+Web UI for the Hermes App Builder pipeline. Describe an app → Studio generates and deploys a full Next.js 14 app to Vercel with a `{slug}.nhkclouds.com` custom domain.
 
-First, run the development server:
+**Stack:** Next.js 16 App Router · Tailwind v4 · TypeScript · dark/light mode
+**Port:** 3100
+**Repo:** `github.com/terenceng81/app-studio`
+
+## Setup (new machine)
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+git clone git@github.com:terenceng81/app-studio.git
+cd app-studio
+npm install
+cp .env.example .env.local   # fill in your keys
+npm run dev                   # http://localhost:3100
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Environment variables
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Copy `.env.example` to `.env.local` and fill in all values.
+When running under Hermes locally, Studio reads keys from `~/.hermes/.env` automatically.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## How the pipeline works
 
-## Learn More
+A single user description triggers 3 stages:
 
-To learn more about Next.js, take a look at the following resources:
+**Stage 1 — Expert design** (`lib/ai-pipeline.ts`)
+`composeWorkflow()` from `agency-orchestrator` dynamically picks 4–6 experts from 199 roles, runs them, and produces a design spec.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+**Stage 2 — Code generation** (`lib/ai-pipeline.ts`)
+`db_architect` decides PATH A (no DB) or PATH B (Neon + Better Auth). `frontend_coder` generates the full file tree. `qa_reviewer` catches deployment-blocking bugs.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+**Stage 3 — Deploy** (`lib/deploy.ts`)
+Neon DB creation → GitHub repo (via Tree API, no git binary) → Vercel project + env vars → Cloudflare CNAME → local registry.
 
-## Deploy on Vercel
+Build progress streams live via SSE at `/api/log/stream`.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Key files
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| File | Purpose |
+|---|---|
+| `lib/ai-pipeline.ts` | Stage 1 + 2 — all LLM calls |
+| `lib/deploy.ts` | Stage 3 — Neon, GitHub, Vercel, Cloudflare |
+| `lib/env.ts` | Reads `~/.hermes/.env`; falls back to `process.env.*` |
+| `lib/build-state.ts` | In-memory SSE log singleton |
+| `app/api/build/route.ts` | POST trigger — fire and forget |
+| `app/api/log/stream/route.ts` | SSE stream for live build log |
+
+## Related repos
+
+- [`app-agents`](https://github.com/terenceng81/app-agents) — original Mac-local `ao` CLI + Python version of the same pipeline
