@@ -1,10 +1,18 @@
-import { spawn } from 'child_process';
-import path from 'path';
-import os from 'os';
 import { getHermesEnv } from '@/lib/env';
 import { buildState, resetBuild, appendLog, finishBuild } from '@/lib/build-state';
+import { createApp } from '@/lib/ai-pipeline';
+import { deployCreate } from '@/lib/deploy';
 
-const BUILD_SCRIPT = path.join(os.homedir(), '.hermes', 'scripts', 'build-app.sh');
+async function buildPipeline(description: string, tgUserId: string) {
+  try {
+    const { files, schemaSql, repoName } = await createApp(description, tgUserId);
+    await deployCreate({ files, schemaSql, repoName, description, tgUserId });
+    finishBuild(0);
+  } catch (err) {
+    appendLog(`[ERROR] ${err instanceof Error ? err.message : String(err)}`);
+    finishBuild(1);
+  }
+}
 
 export async function POST(request: Request) {
   if (buildState.running) {
@@ -30,18 +38,8 @@ export async function POST(request: Request) {
 
   resetBuild(`app-tg${tgUserId}-pending`);
 
-  const child = spawn(
-    'bash',
-    [BUILD_SCRIPT, 'create', tgUserId, 'studio', body.description.trim(), body.provider ?? 'claude-code'],
-    { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-
-  const onData = (d: Buffer) =>
-    d.toString('utf-8').split('\n').forEach(line => appendLog(line));
-
-  child.stdout.on('data', onData);
-  child.stderr.on('data', onData);
-  child.on('close', code => finishBuild(code ?? 1));
+  // Fire-and-forget — client streams progress via /api/log/stream
+  void buildPipeline(body.description.trim(), tgUserId);
 
   return Response.json({ status: 'started', stream: '/api/log/stream' });
 }
