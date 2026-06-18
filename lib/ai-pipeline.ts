@@ -1,17 +1,33 @@
 /**
- * ai-pipeline.ts — replaces ao CLI + build-app.sh stages 1+2
+ * ai-pipeline.ts
  *
- * Stage 1: compose (design spec via multi-expert prompt)
- * Stage 2: db_architect → frontend_coder → qa_reviewer (sequential Claude calls)
- * Stage 3: update pipeline (change_analyzer → db_migration → code_modifier)
- *
- * Runs entirely in Node.js — no ao binary, no bash, no filesystem writes.
- * Compatible with Vercel serverless (fire-and-forget from API route).
+ * Stage 1: dynamic compose — picks 4-6 experts from 199 agency-agents-zh roles
+ *          using agency-orchestrator SDK + Anthropic API key (no ao CLI needed)
+ * Stage 2: fixed quality gate — db_architect → frontend_coder → qa_reviewer
+ *          sequential Anthropic SDK calls with verbatim prompts from finalize-app.yaml
+ * Stage 3: update pipeline — change_analyzer → db_migration → code_modifier
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { buildRoleCatalog, composeWorkflow, run as aoRun } from 'agency-orchestrator';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
 import { getHermesEnv } from './env';
 import { appendLog } from './build-state';
+
+// agency-agents-zh is a top-level dependency in studio/node_modules/
+function getAgentsDir(): string {
+  const candidates = [
+    path.join(process.cwd(), 'node_modules', 'agency-agents-zh'),
+    path.join(process.cwd(), 'node_modules', 'agency-orchestrator', 'node_modules', 'agency-agents-zh'),
+    path.join(process.cwd(), 'node_modules', 'agency-orchestrator', 'agency-agents'),
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(dir)) return dir;
+  }
+  throw new Error('agency-agents-zh not found — run npm install in studio/');
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -73,29 +89,65 @@ export function extractRepoSlug(dbArchitectOutput: string): string {
   return m ? m[1].trim() : 'app';
 }
 
-// ── Stage 1: Design compose ───────────────────────────────────────────────────
+// ── Stage 1: Dynamic compose — picks 4-6 experts from 199 roles ──────────────
 
 async function stage1Compose(description: string): Promise<string> {
-  appendLog(`[${ts()}] Stage 1: Convening design team...`);
-  const system = `You are a multidisciplinary product design team for web applications.
-Your team includes a requirements analyst, UX designer, UI art director, and technical architect.
-You collaborate to produce a comprehensive design specification for Next.js 14 App Router applications.`;
+  appendLog(`[${ts()}] Stage 1: Building role catalog...`);
+  const agentsDir = getAgentsDir();
+  const catalog = buildRoleCatalog(agentsDir);
+  appendLog(`[${ts()}] Stage 1: ${catalog.length} roles — asking Claude to pick experts...`);
 
-  const user = `Design and plan a full-stack Next.js 14 web application (App Router, deployed to Vercel).
+  const env = getHermesEnv();
+  const apiKey = env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
+  const llmConfig = { provider: 'claude' as const, api_key: apiKey, model: 'claude-opus-4-8' };
 
-User requirement: ${description}
+  const composeDesc =
+    `Design and plan a full-stack Next.js 14 web application (App Router, deployed to Vercel).\n` +
+    `User requirement: ${description}\n` +
+    `CONSTRAINTS: (1) Mobile-first — all layouts must work at 375px first, then scale up. ` +
+    `(2) Pick one deliberate aesthetic direction and name it explicitly. ` +
+    `(3) Auth and database are conditional — only if the app truly needs multi-user data or cross-device sync.\n` +
+    `Convene the right experts: requirements analysis, UX flows, UI design direction, data model, feature list.\n` +
+    `Produce the design plan only — do not write the final code.`;
 
-CONSTRAINTS:
-1. Mobile-first — all layouts must work at 375px first, then scale up.
-2. Pick ONE deliberate aesthetic direction (minimalist / retro-futuristic / organic-natural / luxe-refined / playful-toy / editorial-magazine / brutalist / geometric-art-deco / soft-macaron / industrial-utilitarian) and name it explicitly in the spec so the coder carries it through.
-3. Auth and database are conditional — only include if the app truly needs multi-user data or cross-device sync.
+  // composeWorkflow: internally builds the 199-role catalog, asks Claude to pick 4-6,
+  // generates a dynamic workflow YAML, saves it, and returns { yaml, savedPath }
+  const { yaml: composeYaml } = await composeWorkflow({
+    description: composeDesc,
+    agentsDir,
+    llmConfig,
+    autoRun: true,  // embeds task in each step — no {{description}} inputs needed
+    lang: 'en',
+  });
 
-Cover: requirements analysis, UX flows, UI design direction with explicit aesthetic choice, data model, and feature list.
-Produce the design plan only — do not write the final code.`;
+  // Patch agents_dir to absolute path so it resolves correctly when run from /tmp
+  const patchedYaml = composeYaml.replace(
+    /agents_dir:\s*["']?[^\n"']+["']?/,
+    `agents_dir: "${agentsDir}"`,
+  );
 
-  const spec = await callClaude(system, user);
-  appendLog(`[${ts()}] Stage 1 done (${spec.length} chars)`);
-  return spec;
+  // Save patched YAML to /tmp and run it with Anthropic API key (no ao CLI needed)
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ao-stage1-'));
+  const yamlPath = path.join(tmpDir, 'workflow.yaml');
+  const outputDir = path.join(tmpDir, 'output');
+  fs.writeFileSync(yamlPath, patchedYaml);
+
+  appendLog(`[${ts()}] Stage 1: Running dynamic workflow...`);
+  const result = await aoRun(yamlPath, {}, {
+    outputDir,
+    quiet: true,
+    llmOverride: llmConfig,
+  });
+
+  const spec = result.steps
+    .filter(s => s.status === 'completed' && s.output)
+    .map(s => `### ${s.agentName ?? s.id}\n\n${s.output}`)
+    .join('\n\n---\n\n');
+
+  appendLog(`[${ts()}] Stage 1 done — ${result.steps.length} experts, ${spec.length} chars`);
+
+  try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  return spec || description;
 }
 
 // ── Stage 2a: db_architect ────────────────────────────────────────────────────
