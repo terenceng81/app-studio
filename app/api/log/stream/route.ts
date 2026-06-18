@@ -5,9 +5,9 @@ export const dynamic = 'force-dynamic';
 export async function GET() {
   const enc = new TextEncoder();
 
-  // Capture listener refs for cleanup in cancel()
   let onLine: ((line: string) => void) | null = null;
   let onDone: (() => void) | null = null;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
 
   const stream = new ReadableStream({
     start(controller) {
@@ -28,9 +28,20 @@ export async function GET() {
         return;
       }
 
+      // Heartbeat every 20s — keeps reverse proxies (Northflank, nginx) from
+      // closing the idle connection during long LLM calls (30-60s of silence)
+      heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(enc.encode(': ping\n\n'));
+        } catch {
+          if (heartbeat) clearInterval(heartbeat);
+        }
+      }, 20000);
+
       onLine = (line: string) => send({ line });
       onDone = () => {
         send({ done: true });
+        if (heartbeat) clearInterval(heartbeat);
         buildEmitter.off('line', onLine!);
         try { controller.close(); } catch {}
       };
@@ -39,6 +50,7 @@ export async function GET() {
       buildEmitter.once('done', onDone);
     },
     cancel() {
+      if (heartbeat) clearInterval(heartbeat);
       if (onLine) buildEmitter.off('line', onLine);
       if (onDone) buildEmitter.off('done', onDone);
     },
